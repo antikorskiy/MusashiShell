@@ -79,9 +79,9 @@ musashi = "builder:main"
 # URLs
 # =========================================================================== #
 [project.urls]
-Homepage = "https://github.com/MirasakaDrakon/MusashiShell"
-Source   = "https://github.com/MirasakaDrakon/MusashiShell"
-Issues   = "https://github.com/MirasakaDrakon/MusashiShell/issues"
+Homepage = "https://github.com/antikorskiy/MusashiShell"
+Source   = "https://github.com/antikorskiy/MusashiShell"
+Issues   = "https://github.com/antikorskiy/MusashiShell/issues"
 
 # =========================================================================== #
 # Setuptools: package layout
